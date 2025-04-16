@@ -1,152 +1,173 @@
 import discord
 from discord.ext import tasks, commands
 import requests
-import asyncio
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import os
-
-RIOT_API_KEY = os.getenv('RIOT_API_KEY')
-DISCORD_API_KEY = os.getenv('DISCORD_BOT_TOKEN')
-DISCORD_CHANNEL = os.getenv('CHANNEL_ID')
-
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix='!', intents=intents)
+from steam import check_steam_purchases
+load_dotenv()
 
 # Configuration
-REGION = "na1"  # Change to your region
-SUMMONER_NAME = "Upper Decky"  # Without tag
-TAG = '6mil'
-CHECK_INTERVAL = 20  # Minutes
+RIOT_API_KEY = os.getenv('RIOT_API_KEY')
+DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+LOL_CHANNEL_ID = int(os.getenv('LOL_CHANNEL_ID'))
+VAL_CHANNEL_ID = int(os.getenv('VAL_CHANNEL_ID'))
+REGION = 'americas'
+CHECK_INTERVAL = 0.5
+
+# Get all players from environment variable (format: "GameName/Tag,GameName2/Tag2")
+PLAYERS = [p for p in os.getenv('ALL_GAMERS', '').split(',') if p]
+print(PLAYERS)
 
 # Initialize bot
 intents = discord.Intents.default()
 intents.messages = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-class LoLGameTracker:
+class MultiGameTracker:
     def __init__(self):
-        self.last_checked_game_id = None
-        self.summoner_puuid = None
-        self.summoner_name = None
+        self.lol_last_matches = {}  # {puuid: last_match_id}
+        self.val_last_matches = {}  # {puuid: last_match_id}
+        self.player_names = {}  # {puuid: game_name}
         
-        # Initialize summoner data
-        self.initialize_summoner()
+    def initialize_players(self):
+        """Get PUUIDs for all players"""
+        for game_name in PLAYERS:
+            # URL decode the game name (replace %20 with space)
+            url = f"https://{REGION}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}?api_key={RIOT_API_KEY}"
+            print(f"https://{REGION}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}?api_key={RIOT_API_KEY}")
+            response = requests.get(url)
+            print(response)
+            if response.status_code == 200:
+                data = response.json()
+                puuid = data['puuid']
+                self.player_names[puuid] = game_name
+                print(f"Tracking player: {game_name} (PUUID: {puuid})")
 
-    def initialize_summoner(self):
-        """Get summoner PUUID and name"""
-        print('test')
-        summoner_url = f"https://{REGION}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{SUMMONER_NAME}?api_key={RIOT_API_KEY}"
-        response = requests.get(summoner_url)
-        print('test')
+    def get_recent_lol_match(self, puuid):
+        """Get most recent LoL match for a player"""
+        if puuid not in self.lol_last_matches:
+            self.lol_last_matches[puuid] = None
+            
+        matches_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count=1&api_key={RIOT_API_KEY}"
+        response = requests.get(matches_url)
         
-        if response.status_code == 200:
-            data = response.json()
-            self.summoner_puuid = data['puuid']
-            self.summoner_name = data['name']
-            print(f"Tracking summoner: {self.summoner_name} (PUUID: {self.summoner_puuid})")
-        else:
-            print(f"Error initializing summoner: {response.status_code}")
-
-    def get_recent_match(self):
-        """Get the most recent match for the summoner"""
-        if not self.summoner_puuid:
+        if response.status_code != 200:
             return None
             
-        # Get match list (last 20 matches)
-        matches_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/{self.summoner_puuid}/ids?start=0&count=1&api_key={RIOT_API_KEY}"
-        matches_response = requests.get(matches_url)
-        
-        if matches_response.status_code != 200:
-            print(f"Error getting match list: {matches_response.status_code}")
-            return None
-            
-        match_ids = matches_response.json()
+        match_ids = response.json()
         if not match_ids:
             return None
             
         latest_match_id = match_ids[0]
-        
-        # If this is the same as our last checked game, return None
-        if latest_match_id == self.last_checked_game_id:
+        if latest_match_id == self.lol_last_matches[puuid]:
             return None
             
-        # Get match details
         match_url = f"https://americas.api.riotgames.com/lol/match/v5/matches/{latest_match_id}?api_key={RIOT_API_KEY}"
         match_response = requests.get(match_url)
         
-        if match_response.status_code != 200:
-            print(f"Error getting match details: {match_response.status_code}")
+        if match_response.status_code == 200:
+            self.lol_last_matches[puuid] = latest_match_id
+            return match_response.json()
+        return None
+
+    def get_recent_val_match(self, puuid):
+        """Get most recent Valorant match for a player"""
+        if puuid not in self.val_last_matches:
+            self.val_last_matches[puuid] = None
+            
+        url = f"https://americas.api.riotgames.com/val/match/v1/matchlists/by-puuid/{puuid}?api_key={RIOT_API_KEY}"
+        response = requests.get(url)
+        
+        if response.status_code != 200:
             return None
             
-        match_data = match_response.json()
-        self.last_checked_game_id = latest_match_id
-        
-        return match_data
-
-    def format_match_info(self, match_data):
-        """Format match data into a readable string"""
-        # Find the player in the participants
-        player_data = None
-        for participant in match_data['info']['participants']:
-            if participant['puuid'] == self.summoner_puuid:
-                player_data = participant
-                break
-                
-        if not player_data:
-            return "Could not find player in match data"
+        matches = response.json().get('history', [])
+        if not matches:
+            return None
             
-        # Convert timestamp to readable format
-        game_time = datetime.fromtimestamp(match_data['info']['gameCreation'] / 1000)
-        game_duration = timedelta(seconds=match_data['info']['gameDuration'])
+        latest_match_id = matches[0]['matchId']
+        if latest_match_id == self.val_last_matches[puuid]:
+            return None
+            
+        match_url = f"https://americas.api.riotgames.com/val/match/v1/matches/{latest_match_id}?api_key={RIOT_API_KEY}"
+        match_response = requests.get(match_url)
         
-        # Basic match info
-        embed = discord.Embed(
-            title=f"{self.summoner_name}'s Recent Game",
-            color=discord.Color.blue()
-        )
+        if match_response.status_code == 200:
+            self.val_last_matches[puuid] = latest_match_id
+            return match_response.json()
+        return None
+
+    def format_match(self, match_data, puuid, game_type):
+        """Create Discord embed for match"""
+        name = self.player_names[puuid]
         
-        embed.add_field(name="Champion", value=player_data['championName'], inline=True)
-        embed.add_field(name="Role", value=player_data['teamPosition'], inline=True)
-        embed.add_field(name="KDA", value=f"{player_data['kills']}/{player_data['deaths']}/{player_data['assists']}", inline=True)
-        embed.add_field(name="Result", value="Victory" if player_data['win'] else "Defeat", inline=True)
-        embed.add_field(name="Game Mode", value=match_data['info']['gameMode'], inline=True)
-        embed.add_field(name="Duration", value=str(game_duration), inline=True)
-        embed.set_footer(text=f"Played at {game_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if game_type == 'lol':
+            player = next(p for p in match_data['info']['participants'] if p['puuid'] == puuid)
+            embed = discord.Embed(
+                title=f"{name}'s Recent LoL Game",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="Champion", value=player['championName'], inline=True)
+            embed.add_field(name="KDA", value=f"{player['kills']}/{player['deaths']}/{player['assists']}", inline=True)
+            embed.add_field(name="Result", value="Victory" if player['win'] else "Defeat", inline=True)
+            embed.set_footer(text=f"{match_data['info']['gameMode']} | {datetime.fromtimestamp(match_data['info']['gameCreation']/1000).strftime('%m/%d %H:%M')}")
+        
+        else:  # valorant
+            player = next(p for p in match_data['players'] if p['puuid'] == puuid)
+            embed = discord.Embed(
+                title=f"{name}'s Recent Valorant Game",
+                color=0xff4655
+            )
+            embed.add_field(name="Agent", value=player['character'], inline=True)
+            embed.add_field(name="KDA", value=f"{player['stats']['kills']}/{player['stats']['deaths']}/{player['stats']['assists']}", inline=True)
+            embed.set_footer(text=f"{match_data['metadata']['mode']} | {datetime.fromtimestamp(match_data['metadata']['game_start']/1000).strftime('%m/%d %H:%M')}")
         
         return embed
 
 # Initialize tracker
-tracker = LoLGameTracker()
+tracker = MultiGameTracker()
 
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user.name} ({bot.user.id})')
-    check_recent_game.start()
+    print(f'Logged in as {bot.user}')
+    tracker.initialize_players()
+    check_matches.start()
+    check_steam_purchases.start()
 
 @tasks.loop(minutes=CHECK_INTERVAL)
-async def check_recent_game():
-    channel = bot.get_channel(DISCORD_CHANNEL)  # Replace with your channel ID
-    if not channel:
-        print("Channel not found")
-        return
+async def check_matches():
+    """Check for new matches in both games"""
+    lol_channel = bot.get_channel(LOL_CHANNEL_ID)
+    val_channel = bot.get_channel(VAL_CHANNEL_ID)
+    
+    for puuid in tracker.player_names:
+        # Check League matches
+        lol_match = tracker.get_recent_lol_match(puuid)
+        if lol_match and lol_channel:
+            await lol_channel.send(embed=tracker.format_match(lol_match, puuid, 'lol'))
         
-    recent_match = tracker.get_recent_match()
-    if recent_match:
-        match_embed = tracker.format_match_info(recent_match)
-        await channel.send(embed=match_embed)
+        # Check Valorant matches
+        val_match = tracker.get_recent_val_match(puuid)
+        if val_match and val_channel:
+            await val_channel.send(embed=tracker.format_match(val_match, puuid, 'val'))
 
-@check_recent_game.before_loop
-async def before_check_recent_game():
+@check_matches.before_loop
+async def before_checking():
     await bot.wait_until_ready()
 
 @bot.command(name='forcecheck')
-async def force_check(ctx):
-    """Force a check for recent games"""
-    recent_match = tracker.get_recent_match()
-    if recent_match:
-        match_embed = tracker.format_match_info(recent_match)
-        await ctx.send(embed=match_embed)
-    else:
-        await ctx.send(f"No new games found for {tracker.summoner_name}")
+async def force_check(ctx, game: str = None):
+    """Force a check for recent games (!forcecheck lol/val)"""
+    for puuid in tracker.player_names:
+        if not game or game.lower() == 'lol':
+            lol_match = tracker.get_recent_lol_match(puuid)
+            if lol_match:
+                await ctx.send(embed=tracker.format_match(lol_match, puuid, 'lol'))
+        
+        if not game or game.lower() == 'val':
+            val_match = tracker.get_recent_val_match(puuid)
+            if val_match:
+                await ctx.send(embed=tracker.format_match(val_match, puuid, 'val'))
 
-bot.run(DISCORD_API_KEY)
+bot.run(DISCORD_BOT_TOKEN)
